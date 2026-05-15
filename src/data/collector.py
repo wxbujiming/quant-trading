@@ -224,6 +224,7 @@ class DataCollector:
         df = self._request("stock_history", _fetch_tx)
         if df is not None and not df.empty:
             logger.success(f"[{symbol}] 腾讯源成功: {len(df)} 条")
+            df = self._merge_with_cache(df, symbol)
             self._save_to_parquet(df, symbol)
             return df
 
@@ -233,6 +234,7 @@ class DataCollector:
         df = self._request("stock_history", _fetch_sina)
         if df is not None and not df.empty:
             logger.success(f"[{symbol}] 新浪源成功: {len(df)} 条")
+            df = self._merge_with_cache(df, symbol)
             self._save_to_parquet(df, symbol)
             return df
 
@@ -253,8 +255,6 @@ class DataCollector:
             df = self.get_stock_history(symbol, start_date, end_date)
             if not df.empty:
                 results[symbol] = df
-                if save:
-                    self._save_to_parquet(df, symbol)
             if i % 10 == 0:
                 logger.info(f"批量进度: [{i}/{total}] 成功 {len(results)}")
             if i < total:
@@ -262,6 +262,22 @@ class DataCollector:
 
         logger.success(f"批量获取完成，成功 {len(results)}/{total}")
         return results
+
+    def _merge_with_cache(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """
+        将新获取的数据与本地缓存合并（去重），避免增量更新覆盖历史数据
+        """
+        cached = self.load_from_parquet(symbol)
+        if cached.empty:
+            return df
+        if "date" not in df.columns or "date" not in cached.columns:
+            return df
+        combined = pd.concat([cached, df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["date"], keep="last")
+        combined = combined.sort_values("date").reset_index(drop=True)
+        added = len(combined) - len(cached)
+        logger.debug(f"[{symbol}] 合并缓存: {len(cached)} -> {len(combined)} 行 (新增 {added} 条)")
+        return combined
 
     def _save_to_parquet(self, df: pd.DataFrame, symbol: str):
         file_path = self.raw_dir / f"{symbol}.parquet"

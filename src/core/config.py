@@ -55,6 +55,25 @@ class AIConfig:
 
 
 @dataclass
+class NotifyConfig:
+    """通知配置"""
+    enabled: bool = False
+    webhook_url: str = ""
+    notify_on_error: bool = True
+    notify_on_success: bool = False
+
+
+@dataclass
+class ScheduleConfig:
+    """定时任务配置"""
+    enabled: bool = True
+    run_time: str = "16:00"         # 每日运行时间（收盘后）
+    collect_symbols: list = None    # 要采集的股票列表, None=全部已缓存股票
+    max_workers: int = 3            # 并发采集数
+    incremental: bool = True        # 增量更新（只获取最新数据）
+
+
+@dataclass
 class Config:
     """主配置类"""
     project: Dict[str, Any] = field(default_factory=lambda: {
@@ -67,7 +86,8 @@ class Config:
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     ai: AIConfig = field(default_factory=AIConfig)
-    notify: Dict[str, Any] = field(default_factory=dict)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
     
     @classmethod
     def load(cls) -> "Config":
@@ -98,3 +118,4 @@ def reload_config() -> Config:
     global _config
     _config = Config.load()
     return _config
+
