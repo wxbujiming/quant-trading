@@ -31,18 +31,19 @@
 常见问题解答
 
 ```
-Phase 1: 基础框架搭建 ████████░░░░░░░░░░░░ 40% 
+Phase 1: 基础框架搭建 ██████████░░░░░░░░░░ 50% 
 Phase 2: 回测引擎开发 ██████░░░░░░░░░░░░░░ 30% 
 Phase 3: AI模块开发   ░░░░░░░░░░░░░░░░░░░░ 0%  
-Phase 4: 实盘交易     ░░░░░░░░░░░░░░░░░░░░ 0%  
+Phase 4: 实盘交易     █████░░░░░░░░░░░░░░░ 25%  
 Phase 5: 优化扩展     ░░░░░░░░░░░░░░░░░░░░ 0%  
 ```
 
-> 📅 当前阶段: Phase 1 (Week 2) - 已完成项目骨架搭建、数据采集器、回测引擎框架
+> 📅 当前阶段: Phase 1 (Week 2) - 已完成数据采集器(腾讯数据源+熔断重试)、回测引擎
 
 ## ✨ 特性
 
-- 📊 **数据采集**: 支持AKShare采集A股行情数据
+- 📊 **数据采集**: 支持AKShare采集A股行情数据(腾讯证券+新浪财经+东方财富)
+- ⚡ **熔断重试**: CircuitBreaker熔断器+指数退避重试+请求限速+本地Parquet缓存
 - 🤖 **AI能力**: 因子挖掘、机器学习预测、深度学习模型(开发中)
 - 📈 **策略回测**: 事件驱动回测引擎，支持滑点、手续费模拟
 - 💹 **实盘交易**: 支持CTP/QMT/IB等券商接口(开发中)
@@ -164,8 +165,10 @@ make clean       # 清理缓存
 from src.data.collector import DataCollector
 
 collector = DataCollector()
-stock_list = collector.get_stock_list()
-df = collector.get_stock_history("000001", start_date="20200101")
+stock_list = collector.get_stock_list()                        # 获取股票列表
+df = collector.get_stock_history("000001")                     # 获取历史K线(自动走腾讯证券)
+batch = collector.get_stock_history_batch(["000001","600000"]) # 批量采集(带限速)
+info = collector.get_cache_info()                              # 查看本地缓存
 ```
 
 ### 策略开发
