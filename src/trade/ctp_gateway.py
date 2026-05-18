@@ -23,13 +23,13 @@ SIMNOW_MARKET_HOST = "180.168.146.187"
 
 ENVIRONMENTS = {
     "simnow": {
-        "trade": ("180.168.146.187", 10200),
-        "market": ("180.168.146.187", 10210),
+        "trade": ("182.254.243.31", 30001),
+        "market": ("182.254.243.31", 30011),
         "name": "SimNow仿真交易",
     },
     "simnow_7x24": {
-        "trade": ("180.168.146.187", 10130),
-        "market": ("180.168.146.187", 10131),
+        "trade": ("182.254.243.31", 40001),
+        "market": ("182.254.243.31", 40011),
         "name": "SimNow 7x24环境",
     },
 }
@@ -137,8 +137,8 @@ class CtpGateway(BaseGateway):
             # 注册前置地址
             td_addr = self.trade_addr
             md_addr = self.market_addr
-            self._td_api.register_front(td_addr)
-            self._md_api.register_front(md_addr)
+            self._td_api.register_front(f"tcp://{td_addr}")
+            self._md_api.register_front(f"tcp://{md_addr}")
             self.write_log(f"交易前置: {td_addr}")
             self.write_log(f"行情前置: {md_addr}")
 
@@ -310,19 +310,19 @@ class CtpGateway(BaseGateway):
 
         # 方向
         if order.direction == OrderDirection.BUY:
-            ctp_order.Direction = CTPDirection.Buy.encode()
+            ctp_order.Direction = CTPDirection.Buy
         else:
-            ctp_order.Direction = CTPDirection.Sell.encode()
+            ctp_order.Direction = CTPDirection.Sell
 
         # 开平
         if order.offset == "open":
-            ctp_order.CombOffsetFlag = CTPOffset.Open.encode()
+            ctp_order.CombOffsetFlag = CTPOffset.Open
         elif order.offset == "close":
-            ctp_order.CombOffsetFlag = CTPOffset.Close.encode()
+            ctp_order.CombOffsetFlag = CTPOffset.Close
         elif order.offset == "close_today":
-            ctp_order.CombOffsetFlag = CTPOffset.CloseToday.encode()
+            ctp_order.CombOffsetFlag = CTPOffset.CloseToday
         else:
-            ctp_order.CombOffsetFlag = CTPOffset.Open.encode()
+            ctp_order.CombOffsetFlag = CTPOffset.Open
 
         # 价格数量
         ctp_order.LimitPrice = order.price
@@ -424,7 +424,7 @@ class CtpGateway(BaseGateway):
         action.OrderRef = order_ref.encode()
         action.FrontID = front_id
         action.SessionID = session_id
-        action.ActionFlag = CTPActionFlag.Delete.encode()
+        action.ActionFlag = CTPActionFlag.Delete
 
         self._req_id += 1
         ret = self._td_api.req_order_action(action, self._req_id)
@@ -545,7 +545,6 @@ class CtpGateway(BaseGateway):
             CTPOrderStatus.NoTradeNotQueueing: OrderStatus.NOT_TRADED,
             CTPOrderStatus.Canceled: OrderStatus.CANCELED,
             CTPOrderStatus.Unknown: OrderStatus.ERROR,
-            CTPOrderStatus.NotTraded: OrderStatus.NOT_TRADED,
         }
         status = status_map.get(order_info.order_status, OrderStatus.ERROR)
 

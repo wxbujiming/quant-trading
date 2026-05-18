@@ -108,8 +108,8 @@ class LiveConfig:
 
     # CTP 真实接口
     real_mode: bool = False
-    td_address: str = "tcp://180.168.146.187:10200"
-    md_address: str = "tcp://180.168.146.187:10210"
+    td_address: str = "tcp://182.254.243.31:30001"
+    md_address: str = "tcp://182.254.243.31:30011"
 
     # 策略
     symbols: list = None             # 品种列表
