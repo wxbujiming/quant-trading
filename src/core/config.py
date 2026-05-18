@@ -74,6 +74,50 @@ class ScheduleConfig:
 
 
 @dataclass
+class LiveConfig:
+    """实盘引擎配置"""
+    # 网关
+    gateway_name: str = "SimNow"
+    broker_id: str = "9999"
+    user_id: str = ""
+    password: str = ""
+    app_id: str = "simnow_client_test"
+    auth_code: str = "0000000000000000"
+    environment: str = "simnow"           # simnow / simnow_7x24
+
+    # 资金
+    initial_capital: float = 1000000.0
+
+    # 品种参数（与 FuturesBacktestEngine 保持一致）
+    contract_multiplier: int = 10
+    margin_rate: float = 0.10
+    commission_open: float = 0.0001
+    commission_close: float = 0.0001
+    commission_close_today: Optional[float] = None
+    slippage: float = 0.0001
+
+    # K线聚合
+    bar_interval_minutes: int = 1
+
+    # 订单超时
+    order_timeout_seconds: int = 30
+    max_retries: int = 3
+
+    # 状态持久化
+    state_dir: str = "./data/live_state"
+
+    # CTP 真实接口
+    real_mode: bool = False
+    td_address: str = "tcp://180.168.146.187:10200"
+    md_address: str = "tcp://180.168.146.187:10210"
+
+    # 策略
+    symbols: list = None             # 品种列表
+    strategy_name: str = "DualMaCrossStrategy"
+    strategy_params: dict = None
+
+
+@dataclass
 class Config:
     """主配置类"""
     project: Dict[str, Any] = field(default_factory=lambda: {
@@ -88,6 +132,7 @@ class Config:
     ai: AIConfig = field(default_factory=AIConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
     
     @classmethod
     def load(cls) -> "Config":
