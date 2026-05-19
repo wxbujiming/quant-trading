@@ -545,6 +545,7 @@ class FuturesBacktestEngine:
         
         strategy.engine = self
         strategy.symbol = symbol
+        strategy.data = data  # 注入完整数据，用于多时间框架等预计算
         strategy.on_start()
         
         for i, (date, row) in enumerate(data.iterrows()):

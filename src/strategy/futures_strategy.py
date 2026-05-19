@@ -22,6 +22,7 @@ class BaseFuturesStrategy(ABC):
         self.engine = None
         self.symbol = ""
         self.name = self.__class__.__name__
+        self.data: Optional[pd.DataFrame] = None  # 完整数据（on_start 前由引擎注入）
     
     def on_start(self):
         """策略初始化"""

@@ -811,6 +811,30 @@ class CtpTraderApi:
             dll.ctp_trader_destroy(self._handle)
             self._handle = None
 
+    def reinit(self, flow_dir: str = "") -> bool:
+        """
+        释放旧 API 并重新创建（用于断线重连）
+
+        Args:
+            flow_dir: 新的 flow 目录，为空则使用内存模式
+
+        Returns:
+            是否成功
+        """
+        self.release()
+        self._callbacks_set = False
+        try:
+            dll = _load_bridge()
+            fd = flow_dir.encode("utf-8") if flow_dir else b"."
+            self._handle = dll.ctp_trader_create(fd)
+            if not self._handle:
+                return False
+            if self._spi:
+                self._register_callbacks()
+            return True
+        except Exception:
+            return False
+
     def req_user_login(self, broker_id: str, user_id: str, password: str, req_id: int) -> int:
         dll = _load_bridge()
         return dll.ctp_trader_req_user_login(
@@ -958,6 +982,22 @@ class CtpMdApi:
             dll = _load_bridge()
             dll.ctp_md_destroy(self._handle)
             self._handle = None
+
+    def reinit(self, flow_dir: str = "") -> bool:
+        """释放旧 API 并重新创建（用于断线重连）"""
+        self.release()
+        self._callbacks_set = False
+        try:
+            dll = _load_bridge()
+            fd = flow_dir.encode("utf-8") if flow_dir else b"."
+            self._handle = dll.ctp_md_create(fd)
+            if not self._handle:
+                return False
+            if self._spi:
+                self._register_callbacks()
+            return True
+        except Exception:
+            return False
 
     def subscribe_market_data(self, symbol: str) -> int:
         dll = _load_bridge()

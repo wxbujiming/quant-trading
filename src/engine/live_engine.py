@@ -310,6 +310,11 @@ class LiveEngine:
         gateway.on_order = self._on_order
         gateway.on_trade = self._on_trade
         gateway.on_error = self._on_error
+        gateway.on_disconnected = self._on_gateway_disconnected
+
+        # 重连监控
+        self._reconnect_alerted = False
+        self._last_connected_check = 0
 
         logger.info(f"实盘引擎初始化: 资金={config.initial_capital}, 网关={config.gateway_name}")
 
@@ -553,6 +558,9 @@ class LiveEngine:
                     else:
                         self._flush_bars()
 
+                # 连接状态监控
+                self._check_connection_status()
+
                 # 周期风控 + 合约检查 + OI 追踪
                 if self.state != EngineState.STOPPED:
                     self._check_risk_periodic()
@@ -638,6 +646,41 @@ class LiveEngine:
         logger.error(f"网关异常: {msg}")
         if self.alerter:
             self.alerter.send_system_error(f"网关异常: {msg}")
+
+    # ────────────── 连接监控 ──────────────
+
+    def _on_gateway_disconnected(self, reason_type: str, reason_code: int):
+        """网关断开回调"""
+        self.state = EngineState.ERROR
+        self._reconnect_alerted = False
+        logger.warning(f"网关断开: {reason_type}(reason={reason_code})")
+
+        if self.alerter:
+            self.alerter.send_system_error(
+                f"网关断开: {reason_type}, 原因码={reason_code}, 启动自动重连..."
+            )
+
+    def _check_connection_status(self):
+        """定期检查网关连接状态（在主循环中调用）"""
+        now = datetime.now()
+        if (now.timestamp() - self._last_connected_check) < 5:
+            return
+        self._last_connected_check = now.timestamp()
+
+        if hasattr(self.gateway, '_reconnecting') and self.gateway._reconnecting:
+            if not self._reconnect_alerted and time.time() % 30 < 1:
+                self._reconnect_alerted = True
+                attempts = getattr(self.gateway, '_reconnect_attempts', 0)
+                logger.warning(f"网关重连中... (第{attempts}次尝试)")
+            if self.state != EngineState.ERROR:
+                self.state = EngineState.ERROR
+        else:
+            if self.state == EngineState.ERROR and not getattr(self.gateway, '_reconnecting', False):
+                # 检查是否已经恢复正常
+                if self.gateway.connected:
+                    self.state = EngineState.RUNNING
+                    logger.info("网关重连成功，引擎恢复运行")
+                    self._reconnect_alerted = False
 
     # ────────────── 挂单管理 ──────────────
 

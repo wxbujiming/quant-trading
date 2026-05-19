@@ -7,6 +7,7 @@ CTP (SimNow) 期货接口实现
 
 import time
 import os
+import threading
 from datetime import datetime
 from typing import Optional
 from loguru import logger
@@ -80,6 +81,18 @@ class CtpGateway(BaseGateway):
 
         # 账户信息缓存
         self._cached_account: Optional[AccountData] = None
+
+        # ────────── 断线重连状态 ──────────
+        self._reconnect_timer: Optional[threading.Timer] = None
+        self._reconnect_attempts = 0
+        self._reconnect_delay = setting.get("reconnect_initial_delay", 1.0)
+        self._max_reconnect_delay = setting.get("reconnect_max_delay", 30.0)
+        self._max_reconnect_attempts = setting.get("reconnect_max_attempts", 0)
+        self._reconnect_enabled = setting.get("reconnect_enabled", True)
+        self._reconnecting = False
+        self._td_reconnect_required = False
+        self._md_reconnect_required = False
+        self._subscribed_symbols: list = []   # 记住已订阅合约，断线后重新订阅
 
         logger.info(
             f"CTP接口初始化: {self.env_name}, "
@@ -157,12 +170,19 @@ class CtpGateway(BaseGateway):
 
     def close(self):
         """关闭连接"""
-        if self._mode == "real" and self._td_api:
-            self._td_api.release()
-            self._td_api = None
-        if self._mode == "real" and self._md_api:
-            self._md_api.release()
-            self._md_api = None
+        self._cancel_reconnect_timer()
+        self._reconnecting = False
+        self._td_reconnect_required = False
+        self._md_reconnect_required = False
+
+        if self._mode == "real":
+            if self._td_api:
+                self._td_api.release()
+                self._td_api = None
+            if self._md_api:
+                self._md_api.release()
+                self._md_api = None
+
         self._connected = False
         self._logined = False
         self._login_ready = False
@@ -180,7 +200,7 @@ class CtpGateway(BaseGateway):
         spi = self._real_spi
 
         spi.on_front_connected = self._on_td_connected
-        spi.on_front_disconnected = lambda r: self.write_log(f"交易前置断开: {r}")
+        spi.on_front_disconnected = self._on_td_disconnected
         spi.on_rsp_authenticate = lambda: self._real_login()
         spi.on_rsp_user_login = self._on_real_login
         spi.on_rsp_settlement_confirm = lambda: self._on_settlement_confirmed()
@@ -192,7 +212,7 @@ class CtpGateway(BaseGateway):
 
         md_spi = self._real_md_spi
         md_spi.on_front_connected = self._on_md_connected
-        md_spi.on_front_disconnected = lambda r: self.write_log(f"行情前置断开: {r}")
+        md_spi.on_front_disconnected = self._on_md_disconnected
         md_spi.on_rsp_user_login = self._on_md_login
         md_spi.on_rtn_depth_market_data = self._on_real_tick
 
@@ -200,6 +220,9 @@ class CtpGateway(BaseGateway):
         """交易前置连接成功"""
         self.write_log("交易前置已连接")
         self._connected = True
+        # 判断是否重连成功
+        if self._td_reconnect_required:
+            self._on_reconnect_success("td")
         # 发起认证
         self._real_authenticate()
 
@@ -256,11 +279,212 @@ class CtpGateway(BaseGateway):
         """行情登录成功回调 → 刷新待订阅合约"""
         self._md_logined = True
         self.write_log("行情登录成功")
+        # 判断是否重连成功
+        if self._md_reconnect_required:
+            self._on_reconnect_success("md")
         if self._pending_subscriptions:
             symbols = list(set(self._pending_subscriptions))
             self._pending_subscriptions.clear()
             self.write_log(f"刷新 {len(symbols)} 个待订阅合约")
             self._do_subscribe(symbols)
+
+    # ────────── 断线重连 ──────────
+
+    def _on_td_disconnected(self, reason: int):
+        """交易前置断开回调"""
+        self._connected = False
+        self._login_ready = False
+        self._logined = False
+        self._settlement_confirmed = False
+        self.write_log(f"交易前置断开: reason={reason}")
+
+        if not self._reconnect_enabled:
+            self.write_log("断线重连已禁用，不自动重连")
+            return
+
+        self.write_log("启动交易前置重连...")
+        if self.on_disconnected:
+            self.on_disconnected("td", reason)
+        self._start_reconnect_td()
+
+    def _on_md_disconnected(self, reason: int):
+        """行情前置断开回调"""
+        self._md_logined = False
+        self.write_log(f"行情前置断开: reason={reason}")
+
+        if not self._reconnect_enabled:
+            self.write_log("断线重连已禁用，不自动重连")
+            return
+
+        self.write_log("启动行情前置重连...")
+        if self.on_disconnected:
+            self.on_disconnected("md", reason)
+        self._start_reconnect_md()
+
+    def _start_reconnect_td(self):
+        """启动交易前置重连"""
+        self._td_reconnect_required = True
+        self._reconnecting = True
+        self._reconnect_attempts = 0
+        self._cancel_reconnect_timer()
+        self._schedule_reconnect()
+
+    def _start_reconnect_md(self):
+        """启动行情前置重连"""
+        self._md_reconnect_required = True
+        if not self._reconnecting:
+            self._reconnecting = True
+            self._reconnect_attempts = 0
+            self._cancel_reconnect_timer()
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self):
+        """调度下一次重连尝试"""
+        if not self._td_reconnect_required and not self._md_reconnect_required:
+            return
+
+        self._reconnect_attempts += 1
+        if 0 < self._max_reconnect_attempts < self._reconnect_attempts:
+            self.write_error(f"重连已达最大尝试次数 ({self._max_reconnect_attempts}), 放弃重连")
+            return
+
+        delay = min(
+            self._reconnect_delay * (2 ** (self._reconnect_attempts - 1)),
+            self._max_reconnect_delay,
+        )
+        self.write_log(f"计划重连 (第{self._reconnect_attempts}次, {delay:.0f}s后)...")
+
+        self._reconnect_timer = threading.Timer(delay, self._execute_reconnect)
+        self._reconnect_timer.daemon = True
+        self._reconnect_timer.start()
+
+    def _execute_reconnect(self):
+        """执行重连：释放旧 API → 创建新 API → 注册前置 → init"""
+        if not self._td_reconnect_required and not self._md_reconnect_required:
+            self._reconnecting = False
+            return
+
+        self.write_log("执行断线重连...")
+
+        try:
+            if self._mode == "real":
+                self._real_reconnect()
+            else:
+                # 模拟模式：直接重置状态
+                self._connected = True
+                self._logined = True
+                self._reconnecting = False
+                self._td_reconnect_required = False
+                self._md_reconnect_required = False
+                self._on_connected()
+                self._login()
+                self.write_log("模拟模式重连成功")
+        except Exception as e:
+            self.write_error(f"重连失败: {e}")
+            self._schedule_reconnect()
+
+    def _real_reconnect(self):
+        """真实模式重连"""
+        from src.trade.ctp_real_api import (
+            is_ctp_available, CtpTraderApi, CtpMdApi,
+            TraderSpiCb, MdSpiCb,
+        )
+
+        if not is_ctp_available():
+            self.write_error("CTP DLL 不可用，重连失败")
+            self._schedule_reconnect()
+            return
+
+        # ── 重连交易前置 ──
+        if self._td_reconnect_required:
+            self.write_log("重连交易前置...")
+            try:
+                if self._td_api:
+                    self._td_api.reinit("./ctp_flow/td/")
+                else:
+                    os.makedirs("./ctp_flow/td", exist_ok=True)
+                    self._td_api = CtpTraderApi("./ctp_flow/td/")
+                    self._real_spi = TraderSpiCb()
+                    self._setup_td_spi_callbacks()
+                    self._td_api.register_spi(self._real_spi)
+                    self._td_api.register_front(f"tcp://{self.trade_addr}")
+                self._td_api.init()
+            except Exception as e:
+                self.write_error(f"交易前置重连失败: {e}")
+                self._schedule_reconnect()
+                return
+
+        # ── 重连行情前置 ──
+        if self._md_reconnect_required:
+            self.write_log("重连行情前置...")
+            try:
+                if self._md_api:
+                    self._md_api.reinit("./ctp_flow/md/")
+                else:
+                    os.makedirs("./ctp_flow/md", exist_ok=True)
+                    self._md_api = CtpMdApi("./ctp_flow/md/")
+                    self._real_md_spi = MdSpiCb()
+                    self._setup_md_spi_callbacks()
+                    self._md_api.register_spi(self._real_md_spi)
+                    self._md_api.register_front(f"tcp://{self.market_addr}")
+                self._md_api.init()
+            except Exception as e:
+                self.write_error(f"行情前置重连失败: {e}")
+                self._schedule_reconnect()
+                return
+
+    def _setup_td_spi_callbacks(self):
+        """设置交易 SPI 回调（重连时使用已有回调对象）"""
+        if not self._real_spi:
+            return
+        spi = self._real_spi
+        spi.on_front_connected = self._on_td_connected
+        spi.on_front_disconnected = self._on_td_disconnected
+        spi.on_rsp_authenticate = lambda: self._real_login()
+        spi.on_rsp_user_login = self._on_real_login
+        spi.on_rsp_settlement_confirm = lambda: self._on_settlement_confirmed()
+        spi.on_rsp_error = lambda err_id, msg: self.write_error(f"CTP错误 [{err_id}]: {msg}")
+        spi.on_rtn_order = self._on_real_order
+        spi.on_rtn_trade = self._on_real_trade
+        spi.on_rsp_qry_account = self._on_real_account
+        spi.on_rsp_qry_position = self._on_real_position
+
+    def _setup_md_spi_callbacks(self):
+        """设置行情 SPI 回调（重连时使用已有回调对象）"""
+        if not self._real_md_spi:
+            return
+        md_spi = self._real_md_spi
+        md_spi.on_front_connected = self._on_md_connected
+        md_spi.on_front_disconnected = self._on_md_disconnected
+        md_spi.on_rsp_user_login = self._on_md_login
+        md_spi.on_rtn_depth_market_data = self._on_real_tick
+
+    def _on_reconnect_success(self, which: str):
+        """单侧重连成功后处理"""
+        self.write_log(f"{which} 重连成功")
+        if which == "td":
+            self._td_reconnect_required = False
+        else:
+            self._md_reconnect_required = False
+
+        # 两侧都重连成功
+        if not self._td_reconnect_required and not self._md_reconnect_required:
+            self._reconnecting = False
+            self._reconnect_attempts = 0
+            self.write_log("全部重连完成")
+
+            # 重新订阅行情
+            if self._subscribed_symbols:
+                self.write_log(f"重新订阅 {len(self._subscribed_symbols)} 个合约")
+                self.subscribe(self._subscribed_symbols)
+
+    def _cancel_reconnect_timer(self):
+        """取消重连定时器"""
+        if self._reconnect_timer:
+            self._reconnect_timer.cancel()
+            self._reconnect_timer = None
+
+    # ────────── 结算确认（重连后调用） ──────────
 
     def _on_settlement_confirmed(self):
         """结算确认成功"""
@@ -530,6 +754,11 @@ class CtpGateway(BaseGateway):
 
     def subscribe(self, symbols: list):
         """订阅行情"""
+        # 记住订阅列表以备重连后重新订阅
+        for s in symbols:
+            if s not in self._subscribed_symbols:
+                self._subscribed_symbols.append(s)
+
         if self._mode == "real" and self._md_api:
             if self._md_logined:
                 self._do_subscribe(symbols)

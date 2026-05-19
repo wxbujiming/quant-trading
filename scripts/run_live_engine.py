@@ -115,6 +115,11 @@ def main():
             "auth_code": live_cfg.auth_code,
             "environment": live_cfg.environment,
             "real_mode": real_mode,
+            # 断线重连配置
+            "reconnect_enabled": live_cfg.reconnect_enabled,
+            "reconnect_initial_delay": live_cfg.reconnect_initial_delay,
+            "reconnect_max_delay": live_cfg.reconnect_max_delay,
+            "reconnect_max_attempts": live_cfg.reconnect_max_attempts,
         },
     )
 

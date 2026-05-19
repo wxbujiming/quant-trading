@@ -113,6 +113,12 @@ class LiveConfig:
     order_timeout_seconds: int = 30
     max_retries: int = 3
 
+    # 断线重连
+    reconnect_enabled: bool = True
+    reconnect_initial_delay: float = 1.0       # 初始重连延迟（秒）
+    reconnect_max_delay: float = 30.0          # 最大重连延迟
+    reconnect_max_attempts: int = 0            # 最大重试次数，0=无限
+
     # 状态持久化
     state_dir: str = "./data/live_state"
 

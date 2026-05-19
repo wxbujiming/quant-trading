@@ -171,6 +171,7 @@ class BaseGateway(ABC):
         self.on_account = None
         self.on_contract = None
         self.on_error = None
+        self.on_disconnected = None  # callback(reason_type: str, reason_code: int)
 
         # 状态
         self._connected = False
