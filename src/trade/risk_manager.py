@@ -249,7 +249,7 @@ class RiskRatioRule(RiskRule):
         """更新当前风险度"""
         self.total_margin = total_margin
         self.total_equity = total_equity
-        self.current_ratio = total_margin / total_equity if total_equity > 0 else 1.0
+        self.current_ratio = total_margin / total_equity if total_equity > 0 else 0.0
 
     def check(self) -> tuple[bool, str]:
         """风险度检查（开仓前调用）"""

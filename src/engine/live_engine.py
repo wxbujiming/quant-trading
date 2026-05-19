@@ -300,6 +300,14 @@ class LiveEngine:
         self._state_dir = Path(config.state_dir)
         self._state_dir.mkdir(parents=True, exist_ok=True)
 
+        # 权益历史记录（供 PnL 曲线使用）
+        self._equity_recorder = None
+        try:
+            from web.equity_recorder import EquityRecorder
+            self._equity_recorder = EquityRecorder()
+        except Exception:
+            pass
+
         # 主循环控制
         self._running = False
         self._main_thread: Optional[threading.Thread] = None
@@ -464,6 +472,7 @@ class LiveEngine:
         self.strategy = strategy
         self.symbols = symbols
         self.symbol = symbols[0] if symbols else ""
+        self._start_time = datetime.now()  # 连接超时计时起点
 
         # 连接网关
         self.state = EngineState.CONNECTING
@@ -709,7 +718,7 @@ class LiveEngine:
             )
 
     def _check_connection_status(self):
-        """定期检查网关连接状态（在主循环中调用）"""
+        """定期检查网关连接状态（在主循环中调用）。"""
         now = datetime.now()
         if (now.timestamp() - self._last_connected_check) < 5:
             return
@@ -722,13 +731,21 @@ class LiveEngine:
                 logger.warning(f"网关重连中... (第{attempts}次尝试)")
             if self.state != EngineState.ERROR:
                 self.state = EngineState.ERROR
-        else:
-            if self.state == EngineState.ERROR and not getattr(self.gateway, '_reconnecting', False):
-                # 检查是否已经恢复正常
-                if self.gateway.connected:
-                    self.state = EngineState.RUNNING
-                    logger.info("网关重连成功，引擎恢复运行")
-                    self._reconnect_alerted = False
+            return
+
+        # 初始连接超时检测（启动后 60 秒仍未连接上）
+        if not self.gateway.connected and hasattr(self, '_start_time'):
+            elapsed = (now - self._start_time).total_seconds()
+            if elapsed > 60 and self.state not in (EngineState.ERROR, EngineState.STOPPED):
+                logger.error(f"网关连接超时 ({elapsed:.0f}s)，引擎停止")
+                self.state = EngineState.ERROR
+                return
+
+        if self.state == EngineState.ERROR and not getattr(self.gateway, '_reconnecting', False):
+            if self.gateway.connected:
+                self.state = EngineState.RUNNING
+                logger.info("网关重连成功，引擎恢复运行")
+                self._reconnect_alerted = False
 
     # ────────────── 挂单管理 ──────────────
 
@@ -858,15 +875,26 @@ class LiveEngine:
 
     # ────────────── 风控 ──────────────
 
+    _last_alert_times: Dict[str, float] = {}  # 风控告警去重
+
     def _check_risk_periodic(self):
-        """周期风控检查"""
+        """周期风控检查（告警去重，同类型每 60 秒最多一次）。"""
         alerts = self.risk_manager.check_positions()
+        now = time.time()
+
+        # 去重筛选 + 日志
+        new_alerts = []
         for alert in alerts:
+            key = f"{alert['rule']}|{alert.get('symbol', '')}"
+            if now - self._last_alert_times.get(key, 0) < 60:
+                continue
+            self._last_alert_times[key] = now
+            new_alerts.append(alert)
             logger.warning(f"风控告警: {alert['rule']} {alert['symbol']} {alert['message']}")
 
         # 推送到钉钉
         if self.alerter:
-            for alert in alerts:
+            for alert in new_alerts:
                 rule = alert.get("rule", "")
                 msg = alert.get("message", "")
                 symbol = alert.get("symbol", "")
@@ -974,6 +1002,21 @@ class LiveEngine:
                 json.dump(state, f, indent=2, ensure_ascii=False, default=str)
         except Exception as e:
             logger.error(f"状态持久化失败: {e}")
+
+        # 记录权益历史（供 PnL 曲线页面使用）
+        if self._equity_recorder:
+            try:
+                acct = state.get("account", {})
+                if acct:
+                    self._equity_recorder.record(
+                        timestamp=now,
+                        equity=acct.get("balance", 0),
+                        available=acct.get("available", 0),
+                        margin=acct.get("margin", 0),
+                        pnl=acct.get("pnl", 0),
+                    )
+            except Exception as e:
+                logger.error(f"权益记录失败: {e}")
 
     def _restore_state(self):
         """从最近的状态文件恢复"""

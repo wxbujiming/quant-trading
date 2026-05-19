@@ -114,6 +114,8 @@ def main():
             "app_id": live_cfg.app_id,
             "auth_code": live_cfg.auth_code,
             "environment": live_cfg.environment,
+            "td_address": live_cfg.td_address,
+            "md_address": live_cfg.md_address,
             "real_mode": real_mode,
             # 断线重连配置
             "reconnect_enabled": live_cfg.reconnect_enabled,

@@ -24,8 +24,8 @@ SIMNOW_MARKET_HOST = "180.168.146.187"
 
 ENVIRONMENTS = {
     "simnow": {
-        "trade": ("182.254.243.31", 30001),
-        "market": ("182.254.243.31", 30011),
+        "trade": ("182.254.243.31", 40001),
+        "market": ("182.254.243.31", 40011),
         "name": "SimNow仿真交易",
     },
     "simnow_7x24": {
@@ -51,8 +51,11 @@ class CtpGateway(BaseGateway):
 
         env_name = setting.get("environment", "simnow")
         env = ENVIRONMENTS.get(env_name, ENVIRONMENTS["simnow"])
-        self.trade_addr = f"{env['trade'][0]}:{env['trade'][1]}"
-        self.market_addr = f"{env['market'][0]}:{env['market'][1]}"
+        # 支持从配置覆盖前置地址（secrets.yaml 中的 td_address/md_address）
+        raw_td = setting.get("td_address", "")
+        raw_md = setting.get("md_address", "")
+        self.trade_addr = raw_td.removeprefix("tcp://") if raw_td else f"{env['trade'][0]}:{env['trade'][1]}"
+        self.market_addr = raw_md.removeprefix("tcp://") if raw_md else f"{env['market'][0]}:{env['market'][1]}"
         self.env_name = env["name"]
 
         # 模式选择
@@ -401,6 +404,7 @@ class CtpGateway(BaseGateway):
             try:
                 if self._td_api:
                     self._td_api.reinit("./ctp_flow/td/")
+                    self._td_api.register_front(f"tcp://{self.trade_addr}")
                 else:
                     os.makedirs("./ctp_flow/td", exist_ok=True)
                     self._td_api = CtpTraderApi("./ctp_flow/td/")
@@ -420,6 +424,7 @@ class CtpGateway(BaseGateway):
             try:
                 if self._md_api:
                     self._md_api.reinit("./ctp_flow/md/")
+                    self._md_api.register_front(f"tcp://{self.market_addr}")
                 else:
                     os.makedirs("./ctp_flow/md", exist_ok=True)
                     self._md_api = CtpMdApi("./ctp_flow/md/")
