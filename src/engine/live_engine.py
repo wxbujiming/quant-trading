@@ -574,12 +574,60 @@ class LiveEngine:
                     self._save_state()
                     last_persist = time.time()
 
+                # 跨进程命令检查（由 Web 面板写入）
+                self._check_commands()
+
                 time.sleep(0.1)
 
             except Exception as e:
                 logger.error(f"主循环异常: {e}")
                 self.state = EngineState.ERROR
                 time.sleep(1)
+
+    # ────────────── 跨进程命令 ──────────────
+
+    def _check_commands(self):
+        """检查命令文件并执行（Web 面板跨进程控制）。"""
+        cmd_file = self._state_dir / "commands.json"
+        if not cmd_file.exists():
+            return
+        try:
+            with open(cmd_file, "r", encoding="utf-8") as f:
+                cmd = json.load(f)
+            command = cmd.get("command")
+            if command == "pause":
+                self.pause()
+            elif command == "resume":
+                self.resume()
+            elif command == "stop":
+                self.stop()
+            elif command == "close_all":
+                self._close_all_positions()
+            elif command == "cancel_all":
+                self._cancel_all_orders()
+            cmd_file.unlink()  # 删除已执行的命令文件
+        except Exception as e:
+            logger.error(f"命令执行失败: {e}")
+
+    def _close_all_positions(self):
+        """平掉所有持仓（紧急全平，由 Web 面板触发）。"""
+        from src.trade.gateway import OrderDirection as GWDir
+        for pos in self.position_manager.get_all_positions():
+            if pos.volume <= 0:
+                continue
+            if pos.direction == GWDir.BUY:
+                self.order_manager.sell(pos.symbol, pos.price, pos.available)
+                logger.warning(f"全平-平多 {pos.symbol}: {pos.available}手 @ {pos.price}")
+            else:
+                self.order_manager.cover(pos.symbol, pos.price, pos.available)
+                logger.warning(f"全平-平空 {pos.symbol}: {pos.available}手 @ {pos.price}")
+
+    def _cancel_all_orders(self):
+        """取消所有活跃订单（由 Web 面板触发）。"""
+        active = self.order_manager.get_active_orders()
+        for order in active:
+            self.order_manager.cancel(order.order_id)
+        logger.warning(f"已取消 {len(active)} 个活跃订单")
 
     # ────────────── 网关回调 ──────────────
 
