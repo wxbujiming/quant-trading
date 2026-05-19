@@ -28,8 +28,8 @@ ENVIRONMENTS = {
         "name": "SimNow仿真交易",
     },
     "simnow_7x24": {
-        "trade": ("182.254.243.31", 40001),
-        "market": ("182.254.243.31", 40011),
+        "trade": ("182.254.243.31", 30001),
+        "market": ("182.254.243.31", 30011),
         "name": "SimNow 7x24环境",
     },
 }
@@ -69,12 +69,14 @@ class CtpGateway(BaseGateway):
         self._real_spi = None
         self._real_md_spi = None
         self._login_ready = False
+        self._md_logined = False
         self._settlement_confirmed = False
         self._real_account: Optional[AccountData] = None
         self._real_positions: dict = {}
         self._real_orders: dict = {}
         self._req_id = 0
         self._order_ref_real = 0
+        self._pending_subscriptions: list = []
 
         # 账户信息缓存
         self._cached_account: Optional[AccountData] = None
@@ -189,9 +191,9 @@ class CtpGateway(BaseGateway):
         spi.on_rsp_qry_position = self._on_real_position
 
         md_spi = self._real_md_spi
-        md_spi.on_front_connected = lambda: self.write_log("行情前置已连接")
+        md_spi.on_front_connected = self._on_md_connected
         md_spi.on_front_disconnected = lambda r: self.write_log(f"行情前置断开: {r}")
-        md_spi.on_rsp_user_login = lambda d: self.write_log("行情登录成功")
+        md_spi.on_rsp_user_login = self._on_md_login
         md_spi.on_rtn_depth_market_data = self._on_real_tick
 
     def _on_td_connected(self):
@@ -238,6 +240,27 @@ class CtpGateway(BaseGateway):
         self._td_api.req_settlement_info_confirm(
             self.broker_id, self.user_id, self._req_id
         )
+
+    def _on_md_connected(self):
+        """行情前置连接成功 → 发送行情登录"""
+        self.write_log("行情前置已连接")
+        if not self._md_api:
+            return
+        self._req_id += 1
+        ret = self._md_api.req_user_login(
+            self.broker_id, self.user_id, self.password, self._req_id
+        )
+        self.write_log(f"行情登录请求已发送 (ret={ret})")
+
+    def _on_md_login(self, data):
+        """行情登录成功回调 → 刷新待订阅合约"""
+        self._md_logined = True
+        self.write_log("行情登录成功")
+        if self._pending_subscriptions:
+            symbols = list(set(self._pending_subscriptions))
+            self._pending_subscriptions.clear()
+            self.write_log(f"刷新 {len(symbols)} 个待订阅合约")
+            self._do_subscribe(symbols)
 
     def _on_settlement_confirmed(self):
         """结算确认成功"""
@@ -508,11 +531,20 @@ class CtpGateway(BaseGateway):
     def subscribe(self, symbols: list):
         """订阅行情"""
         if self._mode == "real" and self._md_api:
-            for symbol in symbols:
-                ret = self._md_api.subscribe_market_data(symbol)
-                self.write_log(f"[CTP] 订阅行情 {symbol}: ret={ret}")
+            if self._md_logined:
+                self._do_subscribe(symbols)
+            else:
+                # MD 未登录，缓存待登录后发送
+                self._pending_subscriptions.extend(symbols)
+                self.write_log(f"订阅缓存: {len(self._pending_subscriptions)} 个合约待登录后订阅")
         else:
             self.write_log(f"订阅行情: {symbols}")
+
+    def _do_subscribe(self, symbols: list):
+        """实际执行订阅（保证 MD 已登录）"""
+        for symbol in symbols:
+            ret = self._md_api.subscribe_market_data(symbol)
+            self.write_log(f"[CTP] 订阅行情 {symbol}: ret={ret}")
 
     # --------------------------------------------------
     # 订单/持仓查询辅助
@@ -642,32 +674,41 @@ class CtpGateway(BaseGateway):
 
     def _on_real_tick(self, market_data):
         """CTP 行情 Tick 回调"""
+        # 解析 CTP 时间
+        try:
+            action_day = market_data.ActionDay.decode()
+            update_time = market_data.UpdateTime.decode()
+            tick_dt = datetime.strptime(f"{action_day} {update_time}", "%Y%m%d %H:%M:%S")
+        except Exception:
+            tick_dt = datetime.now()
+
         tick = TickData(
             symbol=market_data.InstrumentID.decode(),
             exchange=market_data.ExchangeID.decode(),
             last_price=market_data.LastPrice,
             volume=market_data.Volume,
-            open_interest=market_data.OpenInterest,
-            bid_price1=market_data.BidPrice1,
-            bid_volume1=market_data.BidVolume1,
-            ask_price1=market_data.AskPrice1,
-            ask_volume1=market_data.AskVolume1,
-            bid_price2=market_data.BidPrice2,
-            bid_volume2=market_data.BidVolume2,
-            ask_price2=market_data.AskPrice2,
-            ask_volume2=market_data.AskVolume2,
-            bid_price3=market_data.BidPrice3,
-            bid_volume3=market_data.BidVolume3,
-            ask_price3=market_data.AskPrice3,
-            ask_volume3=market_data.AskVolume3,
-            bid_price4=market_data.BidPrice4,
-            bid_volume4=market_data.BidVolume4,
-            ask_price4=market_data.AskPrice4,
-            ask_volume4=market_data.AskVolume4,
-            bid_price5=market_data.BidPrice5,
-            bid_volume5=market_data.BidVolume5,
-            ask_price5=market_data.AskPrice5,
-            ask_volume5=market_data.AskVolume5,
+            open_interest=int(market_data.OpenInterest),
+            bid_price_1=market_data.BidPrice1,
+            bid_volume_1=market_data.BidVolume1,
+            ask_price_1=market_data.AskPrice1,
+            ask_volume_1=market_data.AskVolume1,
+            bid_price_2=market_data.BidPrice2,
+            bid_volume_2=market_data.BidVolume2,
+            ask_price_2=market_data.AskPrice2,
+            ask_volume_2=market_data.AskVolume2,
+            bid_price_3=market_data.BidPrice3,
+            bid_volume_3=market_data.BidVolume3,
+            ask_price_3=market_data.AskPrice3,
+            ask_volume_3=market_data.AskVolume3,
+            bid_price_4=market_data.BidPrice4,
+            bid_volume_4=market_data.BidVolume4,
+            ask_price_4=market_data.AskPrice4,
+            ask_volume_4=market_data.AskVolume4,
+            bid_price_5=market_data.BidPrice5,
+            bid_volume_5=market_data.BidVolume5,
+            ask_price_5=market_data.AskPrice5,
+            ask_volume_5=market_data.AskVolume5,
+            datetime=tick_dt,
             gateway_name=self.gateway_name,
         )
 

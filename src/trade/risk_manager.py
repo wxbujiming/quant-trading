@@ -3,7 +3,8 @@
 提供止损止盈、仓位控制、风险预警等功能
 """
 
-from typing import Optional, Callable
+from dataclasses import dataclass
+from typing import Optional, Callable, List
 from datetime import datetime, timedelta
 from loguru import logger
 
@@ -449,11 +450,270 @@ class LiquidationWarningRule(RiskRule):
         return True, ""
 
 
+@dataclass
+class ReduceAction:
+    """自动减仓动作"""
+    symbol: str          # 合约代码 (如 "RB2510")
+    direction: str       # "long" / "short"
+    current_volume: int  # 当前持仓手数
+    reduce_volume: int   # 建议减仓手数
+    reduce_type: str     # "partial" / "flat"
+
+
+class AutoReduceRule:
+    """
+    自动减仓检测规则
+
+    风险度 >= flat_all_trigger_ratio → 全部平仓
+    风险度 >= auto_reduce_trigger_ratio → 按比例减仓至目标风险度
+    防抖: 仅上升沿触发，恢复至 target 以下后重置
+    """
+
+    def __init__(self, trigger_ratio: float = 0.95,
+                 target_ratio: float = 0.70,
+                 flat_ratio: float = 1.0):
+        self.trigger_ratio = trigger_ratio
+        self.target_ratio = target_ratio
+        self.flat_ratio = flat_ratio
+        self._last_triggered_ratio: float = 0.0
+
+    def plan(self, positions: list, total_margin: float,
+             total_equity: float, contract_manager=None) -> List[ReduceAction]:
+        """
+        根据当前风险度生成减仓计划
+
+        Args:
+            positions: 持仓列表 (PositionData 对象，需有 symbol, direction, volume, price)
+            total_margin: 总占用保证金
+            total_equity: 总权益
+            contract_manager: ContractManager 实例 (用于计算每手保证金)
+
+        Returns:
+            减仓动作列表 (空列表 = 不触发)
+        """
+        if not positions or total_equity <= 0:
+            self._last_triggered_ratio = 0.0
+            return []
+
+        risk_ratio = total_margin / total_equity
+
+        # 风险度已恢复至目标以下 → 重置
+        if risk_ratio < self.target_ratio:
+            self._last_triggered_ratio = 0.0
+            return []
+
+        # 防抖: 仅当风险度高于上次触发值时才触发
+        if risk_ratio <= self._last_triggered_ratio:
+            return []
+
+        actions: List[ReduceAction] = []
+
+        if risk_ratio >= self.flat_ratio:
+            # 全部平仓
+            for pos in positions:
+                if pos.volume > 0:
+                    actions.append(ReduceAction(
+                        symbol=pos.symbol,
+                        direction=pos.direction.lower(),
+                        current_volume=pos.volume,
+                        reduce_volume=pos.volume,
+                        reduce_type="flat",
+                    ))
+            self._last_triggered_ratio = risk_ratio
+            return actions
+
+        if risk_ratio >= self.trigger_ratio:
+            # 计算需释放的保证金
+            target_margin = total_equity * self.target_ratio
+            reduce_amount = total_margin - target_margin
+
+            if reduce_amount <= 0:
+                return []
+
+            # 计算各品种每手保证金
+            for pos in positions:
+                if pos.volume <= 0:
+                    continue
+                if contract_manager:
+                    base = ContractManager.parse_contract(pos.symbol)["base"]
+                    multiplier = contract_manager.get_multiplier(base)
+                    margin_rate = contract_manager.get_margin_rate(base, pos.symbol)
+                    lot_margin = pos.price * multiplier * margin_rate
+                else:
+                    lot_margin = total_margin / sum(p.volume for p in positions)
+
+                # 该持仓总保证金占比
+                pos_margin = lot_margin * pos.volume
+                fraction = pos_margin / total_margin if total_margin > 0 else 0
+                # 该持仓需释放的保证金
+                pos_reduce_amount = reduce_amount * fraction
+                # 对应手数
+                reduce_vol = max(1, int(pos_reduce_amount / lot_margin))
+                reduce_vol = min(reduce_vol, pos.volume)
+
+                if reduce_vol > 0:
+                    actions.append(ReduceAction(
+                        symbol=pos.symbol,
+                        direction=pos.direction.lower(),
+                        current_volume=pos.volume,
+                        reduce_volume=reduce_vol,
+                        reduce_type="partial",
+                    ))
+
+            self._last_triggered_ratio = risk_ratio
+
+        return actions
+
+
+class CancelMonitorRule(RiskRule):
+    """
+    大额报撤单监控
+
+    三重监控:
+    1. 撤单频率 - 每分钟撤单数超过阈值时拒绝下单
+    2. 报撤比 - 统计窗口内撤单/报单比例超过阈值时告警
+    3. 大额报撤单 - 大额挂单后快速撤单的异常行为检测
+    """
+
+    def __init__(self, max_cancels_per_minute: int = 5,
+                 max_cancel_ratio: float = 0.30,
+                 window_minutes: int = 5,
+                 large_order_volume: int = 100):
+        super().__init__("大额报撤单监控")
+        self.max_cancels_per_minute = max_cancels_per_minute
+        self.max_cancel_ratio = max_cancel_ratio
+        self.window_minutes = window_minutes
+        self.large_order_volume = large_order_volume
+        self.description = (
+            f"撤单频率≤{max_cancels_per_minute}/分钟, "
+            f"报撤比≤{max_cancel_ratio:.0%}, "
+            f"大额阈值≥{large_order_volume}手"
+        )
+
+        # 撤单时间戳列表 (用于频率检测)
+        self._cancel_times: List[datetime] = []
+        # 报单时间戳列表 (用于报撤比计算)
+        self._order_times: List[datetime] = []
+        # 大额撤单事件
+        self._large_cancel_events: List[dict] = []
+        # 已报大额订单: symbol -> {"time": datetime, "volume": int}
+        self._pending_large_orders: dict = {}
+
+        self._last_alert_level = "normal"
+
+    # ────────── 公开记录方法 ──────────
+
+    def record_cancel(self, symbol: str = "", volume: int = 0):
+        """记录一次撤单"""
+        now = datetime.now()
+        self._cancel_times.append(now)
+
+        # 大额报撤单检测
+        large = self._pending_large_orders.pop(symbol, None)
+        if large and volume >= self.large_order_volume:
+            elapsed = (now - large["time"]).total_seconds()
+            self._large_cancel_events.append({
+                "symbol": symbol,
+                "volume": volume,
+                "hold_seconds": elapsed,
+                "time": now,
+            })
+
+    def record_order(self, symbol: str = "", volume: int = 0):
+        """记录一次报单"""
+        self._order_times.append(datetime.now())
+
+        # 记录大额报单用于后续撤单检测
+        if volume >= self.large_order_volume:
+            self._pending_large_orders[symbol] = {
+                "time": datetime.now(),
+                "volume": volume,
+            }
+
+    # ────────── 清理过期数据 ──────────
+
+    def _cleanup(self):
+        """清理超过时间窗口的数据"""
+        now = datetime.now()
+        cutoff = now - timedelta(minutes=self.window_minutes)
+        minute_cutoff = now - timedelta(minutes=1)
+
+        self._cancel_times = [t for t in self._cancel_times if t > minute_cutoff]
+        self._order_times = [t for t in self._order_times if t > cutoff]
+        self._large_cancel_events = [e for e in self._large_cancel_events
+                                     if now - e["time"] < timedelta(minutes=5)]
+
+        # 清理过期的大额挂单记录
+        stale = [s for s, info in self._pending_large_orders.items()
+                 if now - info["time"] > timedelta(minutes=5)]
+        for s in stale:
+            self._pending_large_orders.pop(s, None)
+
+    # ────────── 频率检查 (下单前) ──────────
+
+    def check(self) -> tuple[bool, str]:
+        """下单前撤单频率检查"""
+        if not self.enabled:
+            return True, ""
+
+        self._cleanup()
+
+        if len(self._cancel_times) >= self.max_cancels_per_minute:
+            return False, (
+                f"撤单频率超限: 最近1分钟{len(self._cancel_times)}次, "
+                f"限制{self.max_cancels_per_minute}次/分钟"
+            )
+        return True, ""
+
+    # ────────── 状态检查 (周期性) ──────────
+
+    def get_alerts(self) -> list:
+        """获取报撤单异常告警"""
+        if not self.enabled:
+            return []
+
+        self._cleanup()
+        alerts = []
+
+        # 报撤比检查
+        window_orders = len(self._order_times)
+        window_cancels = len([t for t in self._cancel_times
+                              if t > datetime.now() - timedelta(minutes=self.window_minutes)])
+        if window_orders > 0 and window_cancels > 0:
+            ratio = window_cancels / window_orders
+            if ratio > self.max_cancel_ratio:
+                level = "critical" if ratio > self.max_cancel_ratio * 2 else "warning"
+                alerts.append({
+                    "rule": self.name,
+                    "symbol": "",
+                    "message": (
+                        f"报撤比异常: {ratio:.0%} ({window_cancels}撤/{window_orders}报), "
+                        f"阈值{self.max_cancel_ratio:.0%}"
+                    ),
+                    "level": level,
+                })
+
+        # 大额报撤单告警
+        for event in self._large_cancel_events[-3:]:  # 最近3条
+            alerts.append({
+                "rule": self.name,
+                "symbol": event["symbol"],
+                "message": (
+                    f"大额报撤单: {event['symbol']} "
+                    f"{event['volume']}手, 持仓{event['hold_seconds']:.0f}秒"
+                ),
+                "level": "warning",
+            })
+
+        return alerts
+
+
 class RiskManager:
     """风控系统总管理器"""
 
     def __init__(self, gateway: BaseGateway, initial_cash: float = 1000000.0,
-                 contract_manager: ContractManager = None):
+                 contract_manager: ContractManager = None,
+                 auto_reduce_config: dict = None):
         self.gateway = gateway
         self.order_manager = OrderManager(gateway)
         self.position_manager = PositionManager(gateway, initial_cash)
@@ -471,6 +731,17 @@ class RiskManager:
             self.price_limit_rule = None
             self.liquidation_warning = None
 
+        # 自动减仓规则
+        ac = auto_reduce_config or {}
+        self._auto_reduce_rule = AutoReduceRule(
+            trigger_ratio=ac.get("trigger_ratio", 0.95),
+            target_ratio=ac.get("target_ratio", 0.70),
+            flat_ratio=ac.get("flat_ratio", 1.0),
+        )
+
+        # 大额报撤单监控
+        self.cancel_monitor = CancelMonitorRule()
+
         # 风控规则列表
         self.rules: list[RiskRule] = [
             MaxPositionRule(max_volume=100),
@@ -478,6 +749,7 @@ class RiskManager:
             DailyLossLimitRule(max_daily_loss=initial_cash * 0.05),
             StopLossRule(stop_loss_pct=5.0),
             TradeFrequencyRule(max_orders_per_minute=5),
+            self.cancel_monitor,
         ]
         if contract_manager:
             self.rules.extend([
@@ -567,6 +839,12 @@ class RiskManager:
                 if not passed:
                     return False, msg
 
+            # 报撤单监控
+            elif isinstance(rule, CancelMonitorRule):
+                passed, msg = rule.check()
+                if not passed:
+                    return False, msg
+
         return True, "风控通过"
 
     def check_positions(self) -> list:
@@ -604,7 +882,37 @@ class RiskManager:
                 for alert in rule.get_alerts():
                     alerts.append(alert)
 
+            # 报撤单监控
+            elif isinstance(rule, CancelMonitorRule):
+                for alert in rule.get_alerts():
+                    alerts.append(alert)
+
         return alerts
+
+    def plan_auto_reduce(self) -> List[ReduceAction]:
+        """
+        检查是否触发自动减仓
+
+        Returns:
+            减仓动作列表（空列表 = 不触发）
+        """
+        if not self.contract_manager:
+            return []
+
+        # 更新风险度
+        self._update_risk_metrics()
+
+        positions = [p for p in self.position_manager.get_all_positions() if p.volume > 0]
+        if not positions:
+            return []
+
+        total_margin = self.calc_total_margin()
+        account = self.position_manager.get_account()
+        total_equity = account.balance if account else 0
+
+        return self._auto_reduce_rule.plan(
+            positions, total_margin, total_equity, self.contract_manager,
+        )
 
     def _update_risk_metrics(self):
         """更新保证金和风险度指标"""
@@ -708,6 +1016,14 @@ class RiskManager:
         for rule in self.rules:
             if isinstance(rule, TradeFrequencyRule):
                 rule.record_order()
+
+    def record_cancel(self, symbol: str = "", volume: int = 0):
+        """记录撤单事件（由 LiveEngine._on_order 调用）"""
+        self.cancel_monitor.record_cancel(symbol, volume)
+
+    def record_order(self, symbol: str = "", volume: int = 0):
+        """记录报单事件"""
+        self.cancel_monitor.record_order(symbol, volume)
 
     def print_risk_status(self):
         """打印风控状态"""

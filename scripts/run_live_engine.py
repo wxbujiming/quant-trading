@@ -68,6 +68,7 @@ def main():
     parser.add_argument("--strategy", type=str, default="DualMaCrossStrategy", help="策略名称")
     parser.add_argument("--params", type=str, default=None, help="策略参数JSON (如 '{\"fast_period\": 10}')")
     parser.add_argument("--daemon", action="store_true", help="守护进程模式")
+    parser.add_argument("--real", action="store_true", help="真实模式 (连接SimNow)")
     parser.add_argument("--simulate", action="store_true", help="模拟模式 (自动成交)")
     parser.add_argument("--bar-interval", type=int, default=1, help="K线周期 (分钟)")
     parser.add_argument("--capital", type=float, default=None, help="初始资金")
@@ -103,6 +104,7 @@ def main():
         strategy_params = live_cfg.strategy_params
 
     # 创建网关
+    real_mode = args.real or live_cfg.real_mode
     gateway = CtpGateway(
         gateway_name=live_cfg.gateway_name,
         setting={
@@ -112,6 +114,7 @@ def main():
             "app_id": live_cfg.app_id,
             "auth_code": live_cfg.auth_code,
             "environment": live_cfg.environment,
+            "real_mode": real_mode,
         },
     )
 

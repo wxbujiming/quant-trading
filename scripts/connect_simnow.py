@@ -3,10 +3,12 @@ SimNow 真实接口连接测试
 通过 ctypes CTP API 连接 SimNow 仿真交易环境
 
 用法:
-  set SIMNOW_PASSWORD=your_password
   python scripts/connect_simnow.py
 
-默认使用账号 263533 (SimNow 仿真环境, Broker=9999)
+凭据加载顺序:
+  1. 环境变量 SIMNOW_USER_ID / SIMNOW_PASSWORD
+  2. config/secrets.yaml (ctp 段)
+  3. 默认值 263533
 """
 import sys
 from pathlib import Path
@@ -25,30 +27,39 @@ from src.trade.ctp_gateway import CtpGateway
 from src.trade.gateway import (
     OrderData, OrderDirection, OrderType, OrderStatus,
 )
+from src.core.config import Config
 
 
-def main():
-    user_id = os.getenv("SIMNOW_USER_ID", "263533")
-    password = os.getenv("SIMNOW_PASSWORD", "4@W2NkSA*&6w1##8")
+def load_credentials() -> dict:
+    """按优先级加载凭据: 环境变量 > secrets.yaml > 默认值"""
+    config = Config.load()
 
-    if not password:
-        print("错误: 请设置 SIMNOW_PASSWORD 环境变量")
-        print("  set SIMNOW_PASSWORD=your_password")
-        sys.exit(1)
+    user_id = os.getenv("SIMNOW_USER_ID") or config.live.user_id or "263533"
+    password = os.getenv("SIMNOW_PASSWORD") or config.live.password or ""
 
-    setting = {
+    return {
         "real_mode": True,
-        "broker_id": "9999",
+        "broker_id": config.live.broker_id or "9999",
         "user_id": user_id,
         "password": password,
-        "app_id": "simnow_client_test",
-        "auth_code": "0000000000000000",
+        "app_id": config.live.app_id or "simnow_client_test",
+        "auth_code": config.live.auth_code or "0000000000000000",
         "environment": "simnow_7x24",
     }
 
+
+def main():
+    setting = load_credentials()
+
+    if not setting["password"]:
+        print("错误: 未设置 CTP 密码")
+        print("  方式1: 编辑 config/secrets.yaml 填入 ctp.password")
+        print("  方式2: set SIMNOW_PASSWORD=your_password")
+        sys.exit(1)
+
     print("=" * 60)
     print(f"  SimNow 真实接口连接测试")
-    print(f"  User: {user_id} @ Broker: 9999")
+    print(f"  User: {setting['user_id']} @ Broker: 9999")
     print("=" * 60)
 
     # 结果记录

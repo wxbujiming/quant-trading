@@ -131,10 +131,27 @@ class TickData:
     last_price: float = 0.0       # 最新价
     volume: int = 0               # 成交量
     open_interest: int = 0        # 持仓量
+    # 五档买卖
     bid_price_1: float = 0.0
-    ask_price_1: float = 0.0
     bid_volume_1: int = 0
+    ask_price_1: float = 0.0
     ask_volume_1: int = 0
+    bid_price_2: float = 0.0
+    bid_volume_2: int = 0
+    ask_price_2: float = 0.0
+    ask_volume_2: int = 0
+    bid_price_3: float = 0.0
+    bid_volume_3: int = 0
+    ask_price_3: float = 0.0
+    ask_volume_3: int = 0
+    bid_price_4: float = 0.0
+    bid_volume_4: int = 0
+    ask_price_4: float = 0.0
+    ask_volume_4: int = 0
+    bid_price_5: float = 0.0
+    bid_volume_5: int = 0
+    ask_price_5: float = 0.0
+    ask_volume_5: int = 0
     datetime: datetime = field(default_factory=datetime.now)
     gateway_name: str = ""
 

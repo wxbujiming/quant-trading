@@ -589,6 +589,20 @@ class ContractManager:
         parsed = ContractManager.parse_contract(contract)
         return parsed.get("year", 0) or 0
 
+    @staticmethod
+    def extract_base(symbol: str) -> str:
+        """从合约代码提取品种代码"""
+        return ContractManager.parse_contract(symbol)["base"]
+
+    def has_main_contract(self, base: str) -> bool:
+        """品种是否有非连续的主力合约"""
+        info = self._main_contracts.get(base.upper())
+        return bool(info and not self.parse_contract(info.current_contract)["is_continuous"])
+
+    def get_tracked_bases(self) -> List[str]:
+        """返回所有被跟踪的品种列表"""
+        return list(self._main_contracts.keys())
+
     def get_contract_sort_key(self, contract: str) -> int:
         """
         获取合约排序键（用于找下一个合约）

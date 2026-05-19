@@ -17,13 +17,15 @@ from loguru import logger
 
 from src.backtest.futures_engine import PositionState, PositionSide
 from src.trade.gateway import (
-    BaseGateway, OrderData, TradeData, TickData,
+    BaseGateway, OrderData, TradeData, TickData, OrderDirection,
     OrderStatus,
 )
 from src.trade.risk_manager import RiskManager
 from src.trade.contract_manager import ContractManager, RolloverAction
 from src.strategy.futures_strategy import BaseFuturesStrategy
+from src.monitor.alerter import Alerter
 from src.core.config import LiveConfig
+from src.trade.oi_tracker import OpenInterestTracker
 
 
 class EngineState(Enum):
@@ -234,6 +236,7 @@ class LiveEngine:
         gateway: BaseGateway,
         config: LiveConfig,
         risk_manager: Optional[RiskManager] = None,
+        alerter: Optional[Alerter] = None,
     ):
         self.gateway = gateway
         self.config = config
@@ -242,12 +245,35 @@ class LiveEngine:
         self.contract_manager = ContractManager(engine=self)
 
         # 重用现有的管理器（传入 contract_manager 启用保证金和风险度监控）
+        auto_reduce_config = {
+            "trigger_ratio": config.auto_reduce_trigger_ratio,
+            "target_ratio": config.auto_reduce_target_ratio,
+            "flat_ratio": config.flat_all_trigger_ratio,
+        }
         self.risk_manager = risk_manager or RiskManager(
             gateway, initial_cash=config.initial_capital,
             contract_manager=self.contract_manager,
+            auto_reduce_config=auto_reduce_config,
         )
         self.order_manager = self.risk_manager.order_manager
         self.position_manager = self.risk_manager.position_manager
+
+        # 告警系统（未传入则不启用）
+        self.alerter = alerter
+
+        # OI 主力合约追踪
+        self.oi_tracker: Optional[OpenInterestTracker] = None
+        if config.oi_tracker_enabled:
+            self.oi_tracker = OpenInterestTracker(
+                contract_manager=self.contract_manager,
+                threshold_ratio=config.oi_threshold_ratio,
+                confirmation_count=config.oi_confirmation_count,
+                check_interval_seconds=config.oi_check_interval_seconds,
+                snapshot_interval_seconds=config.oi_snapshot_interval_seconds,
+                min_oi_absolute=config.oi_min_oi_absolute,
+                old_leader_suppress_minutes=config.oi_old_leader_suppress_minutes,
+                on_main_contract_changed=self._on_oi_main_changed,
+            )
 
         # 引擎状态
         self.state = EngineState.IDLE
@@ -303,6 +329,8 @@ class LiveEngine:
             return False
 
         self._track_order(order_id, "open_long", symbol, price, volume)
+        if getattr(self.config, 'cancel_monitor_enabled', True):
+            self.risk_manager.record_order(symbol, volume)
         logger.info(f"开多 {symbol}: {volume}手 @ {price}, 订单={order_id}")
         return True
 
@@ -322,12 +350,14 @@ class LiveEngine:
 
         order_id = self.order_manager.short(symbol, price, volume)
         self._track_order(order_id, "open_short", symbol, price, volume)
+        if getattr(self.config, 'cancel_monitor_enabled', True):
+            self.risk_manager.record_order(symbol, volume)
         logger.info(f"开空 {symbol}: {volume}手 @ {price}, 订单={order_id}")
         return True
 
     def close_long(self, date: datetime, symbol: str, price: float,
                    volume: int = None, is_today: bool = False,
-                   contract: str = "") -> bool:
+                   contract: str = "", skip_risk_check: bool = False) -> bool:
         """平多仓"""
         # 查询当前多仓
         pos = self.position_manager.get_position(symbol)
@@ -337,17 +367,22 @@ class LiveEngine:
         if volume is None or volume > current_vol:
             volume = current_vol
 
-        order_id = self.risk_manager.sell(symbol, price, volume)
+        if skip_risk_check:
+            order_id = self.order_manager.sell(symbol, price, volume)
+        else:
+            order_id = self.risk_manager.sell(symbol, price, volume)
         if not order_id:
             return False
 
         self._track_order(order_id, "close_long", symbol, price, volume)
+        if getattr(self.config, 'cancel_monitor_enabled', True):
+            self.risk_manager.record_order(symbol, volume)
         logger.info(f"平多 {symbol}: {volume}手 @ {price}, 订单={order_id}")
         return True
 
     def close_short(self, date: datetime, symbol: str, price: float,
                     volume: int = None, is_today: bool = False,
-                    contract: str = "") -> bool:
+                    contract: str = "", skip_risk_check: bool = False) -> bool:
         """平空仓"""
         pos = self.position_manager.get_position(symbol)
         current_vol = pos.volume if pos else 0
@@ -358,6 +393,8 @@ class LiveEngine:
 
         order_id = self.order_manager.cover(symbol, price, volume)
         self._track_order(order_id, "close_short", symbol, price, volume)
+        if getattr(self.config, 'cancel_monitor_enabled', True):
+            self.risk_manager.record_order(symbol, volume)
         logger.info(f"平空 {symbol}: {volume}手 @ {price}, 订单={order_id}")
         return True
 
@@ -431,7 +468,16 @@ class LiveEngine:
             return
 
         # 订阅行情
-        self.gateway.subscribe(symbols)
+        all_symbols = list(symbols)
+
+        # OI 追踪额外订阅
+        if self.oi_tracker:
+            extra = self.oi_tracker.get_required_subscriptions(symbols)
+            all_symbols.extend(extra)
+            if extra:
+                logger.info(f"OI 追踪额外订阅 {len(extra)} 个合约")
+
+        self.gateway.subscribe(all_symbols)
 
         # 初始化 K线聚合器
         for sym in symbols:
@@ -462,6 +508,8 @@ class LiveEngine:
         if self._main_thread:
             self._main_thread.join(timeout=10)
         self.contract_manager.stop()
+        if self.oi_tracker:
+            self.oi_tracker.disable()
         self._save_state()
         self.gateway.close()
         self.state = EngineState.STOPPED
@@ -505,10 +553,13 @@ class LiveEngine:
                     else:
                         self._flush_bars()
 
-                # 周期风控 + 合约检查
+                # 周期风控 + 合约检查 + OI 追踪
                 if self.state != EngineState.STOPPED:
                     self._check_risk_periodic()
                     self.contract_manager.periodic_check()
+                    self._check_rollover_alerts()
+                    if self.oi_tracker:
+                        self.oi_tracker.check()
 
                 # 定时持久化
                 if time.time() - last_persist > 30:
@@ -525,7 +576,12 @@ class LiveEngine:
     # ────────────── 网关回调 ──────────────
 
     def _on_tick(self, tick: TickData):
-        """Tick 回调 → K线聚合 → on_bar"""
+        """Tick 回调 → K线聚合 + OI 追踪"""
+        # OI 追踪（处理所有 tick，包括 OI 额外订阅的合约）
+        if self.oi_tracker and self.state == EngineState.RUNNING:
+            self.oi_tracker.on_tick(tick)
+
+        # K线聚合（只处理用户交易合约的 tick）
         aggregator = self._bar_aggregators.get(tick.symbol)
         if not aggregator:
             return
@@ -554,6 +610,9 @@ class LiveEngine:
                     info.filled_volume = order.traded
                 elif order.status in (OrderStatus.CANCELED,):
                     info.status = "canceled"
+                    # 记录撤单事件用于报撤单监控
+                    if getattr(self.config, 'cancel_monitor_enabled', True):
+                        self.risk_manager.record_cancel(order.symbol, info.volume)
                 elif order.status in (OrderStatus.REJECTED, OrderStatus.ERROR):
                     info.status = "failed"
                 elif order.status == OrderStatus.PART_TRADED:
@@ -565,9 +624,20 @@ class LiveEngine:
         """成交回调"""
         logger.info(f"成交: {trade.symbol} {trade.direction.value} {trade.volume}手 @ {trade.price}")
 
+        if self.alerter:
+            dir_label = {
+                OrderDirection.BUY: "开多",
+                OrderDirection.SELL: "平多",
+                OrderDirection.SHORT: "开空",
+                OrderDirection.COVER: "平空",
+            }.get(trade.direction, trade.direction.value)
+            self.alerter.send_trade(trade.symbol, dir_label, trade.volume, trade.price)
+
     def _on_error(self, msg: str):
         """网关错误回调"""
         logger.error(f"网关异常: {msg}")
+        if self.alerter:
+            self.alerter.send_system_error(f"网关异常: {msg}")
 
     # ────────────── 挂单管理 ──────────────
 
@@ -666,6 +736,35 @@ class LiveEngine:
             logger.error(f"重发订单异常: {e}")
         return None
 
+    # ────────────── OI 主力合约变更回调 ──────────────
+
+    def _on_oi_main_changed(self, base: str, old_contract: str, new_contract: str):
+        """OI 追踪检测到主力变更时回调"""
+        changed = self.contract_manager.update_main_contract(
+            base, new_contract,
+            open_interest_ratio=0.0,
+            detected_method="open_interest",
+        )
+        if changed:
+            self.contract_manager.detect_rollover(base, new_contract)
+            logger.info(f"[{base}] OI 检测换月: {old_contract} → {new_contract}")
+            if self.alerter:
+                self.alerter.send_rollover(base, old_contract, new_contract)
+
+    # ────────────── 换月通知 ──────────────
+
+    _notified_rollovers: set = set()
+
+    def _check_rollover_alerts(self):
+        """检查是否有新完成的换月移仓，推送通知"""
+        if not self.alerter:
+            return
+        for record in self.contract_manager.list_rollovers():
+            key = f"{record.old_contract}->{record.new_contract}"
+            if key not in self._notified_rollovers and record.action == RolloverAction.COMPLETED:
+                self._notified_rollovers.add(key)
+                self.alerter.send_rollover(record.base, record.old_contract, record.new_contract)
+
     # ────────────── 风控 ──────────────
 
     def _check_risk_periodic(self):
@@ -673,6 +772,75 @@ class LiveEngine:
         alerts = self.risk_manager.check_positions()
         for alert in alerts:
             logger.warning(f"风控告警: {alert['rule']} {alert['symbol']} {alert['message']}")
+
+        # 推送到钉钉
+        if self.alerter:
+            for alert in alerts:
+                rule = alert.get("rule", "")
+                msg = alert.get("message", "")
+                symbol = alert.get("symbol", "")
+                level = alert.get("level", "warning")
+
+                if "止损" in rule or "止损" in msg:
+                    self.alerter.send_stop_loss(symbol, "", 0.0, 0.0, 0.0)
+                elif "强平" in rule or "强平" in msg or level == "critical":
+                    margin_status = self.risk_manager.get_margin_status()
+                    self.alerter.send_liquidation_warning(
+                        margin_status["risk_ratio"],
+                        margin_status["total_equity"],
+                        margin_status["total_margin"],
+                    )
+                elif "保证金" in rule or "风险度" in rule:
+                    margin_status = self.risk_manager.get_margin_status()
+                    self.alerter.send_margin_warning(
+                        margin_status["total_equity"],
+                        margin_status["total_margin"],
+                        margin_status["risk_ratio"],
+                    )
+                elif "报撤" in rule or "报撤单" in rule or "大额" in msg:
+                    if "大额" in msg and symbol:
+                        self.alerter.send_cancel_warning(
+                            large_cancel={"symbol": symbol, "volume": 0, "hold_seconds": 0},
+                        )
+                    elif "报撤比" in msg:
+                        self.alerter.send_cancel_warning(
+                            cancel_count=0, window_minutes=5,
+                            cancel_ratio=0.5,
+                        )
+                    else:
+                        self.alerter.send_cancel_warning(cancel_count=0, window_minutes=1)
+
+        # 自动减仓执行
+        if not self.config.auto_reduce_enabled:
+            return
+
+        actions = self.risk_manager.plan_auto_reduce()
+        for action in actions:
+            if action.reduce_volume <= 0:
+                continue
+            if action.direction == "long":
+                self.close_long(
+                    datetime.now(), action.symbol, 0, action.reduce_volume,
+                    skip_risk_check=True,
+                )
+            elif action.direction == "short":
+                self.close_short(
+                    datetime.now(), action.symbol, 0, action.reduce_volume,
+                    skip_risk_check=True,
+                )
+            logger.warning(
+                f"自动减仓: {action.symbol} {action.direction} "
+                f"减{action.reduce_volume}/{action.current_volume}手 "
+                f"类型={action.reduce_type}"
+            )
+            if self.alerter:
+                self.alerter.send_auto_reduce(
+                    symbol=action.symbol,
+                    direction=action.direction,
+                    reduce_volume=action.reduce_volume,
+                    current_volume=action.current_volume,
+                    reduce_type=action.reduce_type,
+                )
 
     # ────────────── K线刷新 ──────────────
 
