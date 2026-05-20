@@ -20,7 +20,7 @@ def show():
         st.info(
             "权益历史数据由引擎运行时自动记录。\n\n"
             "如需启用，请确保引擎运行时 EquityRecorder 正在记录。\n"
-            "数据文件位置: data/live_state/equity_history.csv"
+            "数据存储位置: data/live_state/trade.db (SQLite)"
         )
         return
 
@@ -127,8 +127,9 @@ def show():
     with st.expander("查看原始数据"):
         display_df = df.copy()
         display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        display_df = display_df[["timestamp", "equity", "available", "margin", "pnl"]]
         display_df.columns = ["时间", "总权益", "可用资金", "占用保证金", "浮动盈亏"]
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.dataframe(display_df.iloc[::-1], use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
