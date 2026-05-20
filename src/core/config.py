@@ -4,7 +4,7 @@
 """
 from pathlib import Path
 from typing import Any, Dict, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 import os
 
 try:
@@ -179,13 +179,25 @@ class Config:
     live: LiveConfig = field(default_factory=LiveConfig)
     
     @classmethod
-    def load(cls, secrets_path: str = "./config/secrets.yaml") -> "Config":
-        """加载配置（优先从环境变量或配置文件）"""
+    def load(cls, secrets_path: str = "./config/secrets.yaml",
+             use_db: bool = True) -> "Config":
+        """加载配置（优先从数据库，其次 YAML，最后 dataclass 默认值）"""
         config = cls()
 
-        # 从环境变量加载（如果存在）
-        data_raw = os.getenv("DATA_RAW_DIR", config.data.raw_dir)
-        config.data.raw_dir = data_raw
+        if use_db:
+            try:
+                from src.core.config_store import ConfigStore
+                store = ConfigStore()
+                if store.load_into(config):
+                    return config
+                # DB 为空 — 自动从 secrets.yaml 迁移
+                store.migrate_from_yaml(secrets_path)
+                # 迁移后重新加载
+                store.load_into(config)
+                return config
+            except Exception as e:
+                import logging as _lg
+                _lg.warning(f"从数据库加载配置失败，回退到 YAML: {e}")
 
         # 从 secrets.yaml 加载（如果存在） — 主要是钉钉和券商密钥
         secrets_file = Path(secrets_path)
@@ -223,6 +235,44 @@ class Config:
                 logging.warning(f"加载 secrets.yaml 失败: {e}")
 
         return config
+
+    def to_dict(self) -> Dict[str, Any]:
+        """将 Config 对象转为嵌套 dict。"""
+        return {
+            "project": dict(self.project),
+            "data": asdict(self.data),
+            "logging": asdict(self.logging),
+            "backtest": asdict(self.backtest),
+            "strategy": asdict(self.strategy),
+            "ai": asdict(self.ai),
+            "schedule": asdict(self.schedule),
+            "notify": asdict(self.notify),
+            "live": asdict(self.live),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Config":
+        """从嵌套 dict 恢复 Config（合并到默认值之上）。"""
+        cfg = cls()
+        section_map = {
+            "data": "data", "logging": "logging", "backtest": "backtest",
+            "strategy": "strategy", "ai": "ai", "schedule": "schedule",
+            "notify": "notify", "live": "live",
+        }
+        for key, section_name in section_map.items():
+            section_data = data.get(key, {})
+            section = getattr(cfg, section_name)
+            for field_name, field_value in section_data.items():
+                if hasattr(section, field_name):
+                    setattr(section, field_name, field_value)
+        if "project" in data:
+            cfg.project.update(data["project"])
+        return cfg
+
+    def save(self):
+        """将配置持久化到 SQLite。"""
+        from src.core.config_store import ConfigStore
+        ConfigStore().save_from(self)
 
 
 # 全局配置实例

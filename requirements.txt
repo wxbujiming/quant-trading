@@ -29,6 +29,9 @@ rich>=13.0.0
 plotly>=5.18.0
 # matplotlib>=3.7.0  # 可选安装 (需要编译)
 
+# 加密
+cryptography>=41.0.0
+
 # 机器学习 (已安装64位预编译wheel)
 scikit-learn>=1.3.0
 xgboost>=2.0.0

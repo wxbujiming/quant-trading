@@ -49,6 +49,7 @@ logs/
 config/secrets.yaml
 .env
 *.local
+data/.config_key
 
 # ============================================
 # Notebook输出

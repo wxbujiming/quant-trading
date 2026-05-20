@@ -134,6 +134,7 @@ with st.sidebar:
         "📊 K线图",
         "📝 日志",
         "🛡️ 风控",
+        "⚙️ 配置",
         "🎮 控制",
     ]
     page_choice = st.radio(
@@ -159,6 +160,7 @@ _page_modules = {
     "📊 K线图": "web.pages.kline",
     "📝 日志": "web.pages.logs",
     "🛡️ 风控": "web.pages.risk",
+    "⚙️ 配置": "web.pages.config_editor",
     "🎮 控制": "web.pages.controls",
 }
 
