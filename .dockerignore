@@ -1,0 +1,49 @@
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.python-version
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 运行时数据（挂载卷覆盖）
+data/live_state/
+data/raw/
+data/cache/
+data/processed/
+logs/
+ctp_flow/
+reports/
+
+# 配置文件（需挂载卷注入）
+config/secrets.yaml
+
+# Claude
+.claude/
+
+# Jupyter
+*.ipynb
+
+# Docker
+Dockerfile
+.dockerignore
