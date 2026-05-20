@@ -173,19 +173,19 @@ class TaskScheduler:
 
     def summary(self) -> str:
         """打印所有任务状态"""
-        lines = ["━━━ 任务调度器状态 ━━━"]
+        lines = ["=== 任务调度器状态 ==="]
         for t in self._tasks:
-            status = "✅" if t.enabled else "⏸"
+            status = "[x]" if t.enabled else "[ ]"
             last = t.last_run.strftime("%Y-%m-%d") if t.last_run else "-"
-            errors = f" 错误×{t.error_count}" if t.error_count else ""
+            errors = f" errx{t.error_count}" if t.error_count else ""
             lines.append(
                 f"  {status} [{t.name:16s}] "
                 f"{t.hour:02d}:{t.minute:02d} "
-                f"上次={last}{errors}"
+                f"last={last}{errors}"
             )
         for t in self._interval_tasks:
             next_run = int(t["interval"] - (time.time() - t["last_run"]))
-            lines.append(f"  🔄 [{t['name']:16s}] 每 {t['interval']/60:.0f}min 下次={next_run}s后")
+            lines.append(f"  [~] [{t['name']:16s}] every {t['interval']/60:.0f}min next={next_run}s")
         return "\n".join(lines)
 
     # ────────── 内部调度循环 ──────────

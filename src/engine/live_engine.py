@@ -310,6 +310,7 @@ class LiveEngine:
 
         # 主循环控制
         self._running = False
+        self._last_heartbeat = 0.0
         self._main_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
@@ -581,6 +582,14 @@ class LiveEngine:
                 # 定时持久化
                 if time.time() - last_persist > 30:
                     self._save_state()
+                    # 每 5 分钟输出一次心跳日志，便于监控引擎存活状态
+                    if time.time() - self._last_heartbeat > 300:
+                        self._last_heartbeat = time.time()
+                        logger.info(
+                            f"引擎心跳: state={self.state.name}, "
+                            f"connected={self.gateway.connected}, "
+                            f"pending_orders={len(self._pending_orders)}"
+                        )
                     last_persist = time.time()
 
                 # 跨进程命令检查（由 Web 面板写入）

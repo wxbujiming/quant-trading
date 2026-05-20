@@ -164,7 +164,10 @@ def main():
 
     finally:
         engine.stop()
-        engine.risk_manager.print_system_summary()
+        try:
+            engine.risk_manager.print_system_summary()
+        except Exception:
+            pass
         logger.success("实盘引擎已安全停止")
 
 

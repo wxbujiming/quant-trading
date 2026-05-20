@@ -96,7 +96,7 @@ class LiveConfig:
     environment: str = "simnow"           # simnow / simnow_7x24
 
     # 资金
-    initial_capital: float = 1000000.0
+    initial_capital: float = 20000000.0
 
     # 品种参数（与 FuturesBacktestEngine 保持一致）
     contract_multiplier: int = 10
@@ -123,14 +123,19 @@ class LiveConfig:
     state_dir: str = "./data/live_state"
 
     # CTP 真实接口
-    real_mode: bool = False
+    real_mode: bool = True
     td_address: str = ""
     md_address: str = ""
 
-    # 策略
-    symbols: list = None             # 品种列表
+    # 策略（使用 field 避免可变默认值问题）
+    symbols: list = field(default_factory=lambda: ["RB2610"])
     strategy_name: str = "DualMaCrossStrategy"
-    strategy_params: dict = None
+    strategy_params: dict = field(default_factory=lambda: {
+        "fast_period": 15,
+        "slow_period": 40,
+        "atr_multiplier": 2.5,
+        "max_risk_pct": 0.01,
+    })
 
     # OI 主力合约追踪
     oi_tracker_enabled: bool = True
