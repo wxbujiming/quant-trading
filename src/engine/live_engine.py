@@ -26,6 +26,7 @@ from src.strategy.futures_strategy import BaseFuturesStrategy
 from src.monitor.alerter import Alerter
 from src.core.config import LiveConfig
 from src.trade.oi_tracker import OpenInterestTracker
+from src.storage.database import TradeDatabase
 
 
 class EngineState(Enum):
@@ -307,6 +308,13 @@ class LiveEngine:
             self._equity_recorder = EquityRecorder()
         except Exception:
             pass
+
+        # SQLite 持久化数据库
+        self._db: Optional[TradeDatabase] = None
+        try:
+            self._db = TradeDatabase()
+        except Exception as e:
+            logger.warning(f"数据库初始化失败: {e}")
 
         # 主循环控制
         self._running = False
@@ -698,6 +706,24 @@ class LiveEngine:
         """成交回调"""
         logger.info(f"成交: {trade.symbol} {trade.direction.value} {trade.volume}手 @ {trade.price}")
 
+        # 记录到数据库
+        if self._db and self.config:
+            try:
+                td = getattr(self, '_trading_day', datetime.now().strftime('%Y%m%d'))
+                self._db.record_trade(
+                    symbol=trade.symbol,
+                    direction=trade.direction.value if hasattr(trade.direction, 'value') else str(trade.direction),
+                    volume=trade.volume,
+                    price=trade.price,
+                    trade_time=trade.trade_time.isoformat() if hasattr(trade.trade_time, 'isoformat') else str(trade.trade_time),
+                    trade_id=getattr(trade, 'trade_id', ''),
+                    order_id=getattr(trade, 'order_id', ''),
+                    offset_flag=getattr(trade, 'offset', ''),
+                    trading_day=td,
+                )
+            except Exception as e:
+                logger.error(f"记录成交失败: {e}")
+
         if self.alerter:
             dir_label = {
                 OrderDirection.BUY: "开多",
@@ -995,8 +1021,9 @@ class LiveEngine:
     # ────────────── 状态持久化 ──────────────
 
     def _save_state(self):
-        """保存引擎状态到磁盘"""
+        """保存引擎状态到磁盘 + 数据库"""
         now = datetime.now()
+        trading_day = now.strftime("%Y%m%d")
         state = {
             "timestamp": now.isoformat(),
             "trading_day": now.strftime("%Y-%m-%d"),
@@ -1005,18 +1032,52 @@ class LiveEngine:
             "pending_orders": self._serialize_pending_orders(),
             "account": self._serialize_account(),
         }
+
+        # ── JSON 快照（兼容层） ──
         state_file = self._state_dir / f"live_state_{now.strftime('%Y%m%d')}.json"
         try:
             with open(state_file, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2, ensure_ascii=False, default=str)
         except Exception as e:
-            logger.error(f"状态持久化失败: {e}")
+            logger.error(f"JSON 持久化失败: {e}")
 
-        # 记录权益历史（供 PnL 曲线页面使用）
-        if self._equity_recorder:
+        # ── SQLite 持久化 ──
+        acct = state.get("account", {})
+        if self._db:
             try:
-                acct = state.get("account", {})
-                if acct:
+                self._db.save_state(
+                    trading_day=trading_day,
+                    state=self.state.name,
+                    balance=acct.get("balance", 0),
+                    available=acct.get("available", 0),
+                    margin=acct.get("margin", 0),
+                    pnl=acct.get("pnl", 0),
+                    positions=state.get("positions", []),
+                    pending_orders=state.get("pending_orders", []),
+                )
+            except Exception as e:
+                logger.error(f"DB 状态持久化失败: {e}")
+
+        # ── 权益历史 ──
+        acct = state.get("account", {})
+        if acct:
+            # SQLite 权益记录
+            if self._db:
+                try:
+                    self._db.record_equity(
+                        timestamp=now,
+                        equity=acct.get("balance", 0),
+                        available=acct.get("available", 0),
+                        margin=acct.get("margin", 0),
+                        pnl=acct.get("pnl", 0),
+                        trading_day=trading_day,
+                    )
+                except Exception as e:
+                    logger.error(f"DB 权益记录失败: {e}")
+
+            # CSV 权益记录（兼容层）
+            if self._equity_recorder:
+                try:
                     self._equity_recorder.record(
                         timestamp=now,
                         equity=acct.get("balance", 0),
@@ -1024,11 +1085,25 @@ class LiveEngine:
                         margin=acct.get("margin", 0),
                         pnl=acct.get("pnl", 0),
                     )
-            except Exception as e:
-                logger.error(f"权益记录失败: {e}")
+                except Exception as e:
+                    logger.error(f"CSV 权益记录失败: {e}")
 
     def _restore_state(self):
-        """从最近的状态文件恢复"""
+        """从数据库或 JSON 恢复状态"""
+        today = datetime.now().strftime('%Y%m%d')
+
+        # 优先从 SQLite 恢复
+        if self._db:
+            try:
+                row = self._db.load_latest_state()
+                if row and row.get("trading_day") == today:
+                    logger.info(f"DB 状态恢复: state={row.get('state')}, "
+                                f"余额={row.get('balance'):.0f}")
+                    return
+            except Exception as e:
+                logger.debug(f"DB 状态恢复失败: {e}")
+
+        # 回退到 JSON 快照
         state_file = self._state_dir / f"live_state_{datetime.now().strftime('%Y%m%d')}.json"
         if not state_file.exists():
             logger.info("无历史状态需要恢复")
@@ -1036,9 +1111,9 @@ class LiveEngine:
         try:
             with open(state_file, "r", encoding="utf-8") as f:
                 state = json.load(f)
-            logger.info(f"状态恢复完成: {state_file.name} (state={state.get('state')})")
+            logger.info(f"JSON 状态恢复: {state_file.name} (state={state.get('state')})")
         except Exception as e:
-            logger.error(f"状态恢复失败: {e}")
+            logger.error(f"JSON 状态恢复失败: {e}")
 
     def _serialize_positions(self) -> list:
         """序列化持仓"""

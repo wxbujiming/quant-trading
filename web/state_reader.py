@@ -20,6 +20,23 @@ from typing import Optional, Any
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# SQLite 数据库读取器（跨进程读取替代 JSON 快照）
+# ---------------------------------------------------------------------------
+_DB_READER = None
+
+
+def _get_db_reader():
+    global _DB_READER
+    if _DB_READER is None:
+        try:
+            from src.storage.database import TradeDatabase
+            _DB_READER = TradeDatabase()
+        except Exception:
+            _DB_READER = False  # 标记不可用
+    return _DB_READER if _DB_READER else None
+
+
+# ---------------------------------------------------------------------------
 # 路径常量
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -392,6 +409,14 @@ def get_trades() -> list:
             return result
         except Exception as exc:
             logger.warning("state_reader: 读取成交异常: %s", exc)
+
+    # 回退到 SQLite
+    db = _get_db_reader()
+    if db:
+        try:
+            return db.get_trades()
+        except Exception as exc:
+            logger.warning("state_reader: 读取 DB 成交异常: %s", exc)
     return []
 
 
@@ -505,6 +530,17 @@ def get_equity_history() -> "list[dict]":
     Returns:
         list[dict]: [{timestamp, equity, available, margin, pnl}, ...]
     """
+    # 优先从 SQLite 读取
+    db = _get_db_reader()
+    if db:
+        try:
+            rows = db.get_equity_history()
+            if rows:
+                return rows
+        except Exception as exc:
+            logger.warning("state_reader: 读取 DB 权益历史异常: %s", exc)
+
+    # 回退到 CSV 文件
     csv_path = EQUITY_HISTORY_CSV
     if not csv_path.exists():
         return []
@@ -671,3 +707,18 @@ def _cancel_all_orders(engine) -> dict:
         return {"success": True, "message": f"已提交 {count} 个撤单请求"}
     except Exception as exc:
         return {"success": False, "message": f"撤单失败: {exc}"}
+
+
+def get_strategy_signals(symbol: str = "", limit: int = 200) -> list:
+    """获取策略信号记录（从 SQLite）。
+
+    Returns:
+        list[dict]: [{symbol, signal_type, price, volume, reason, bar_time, strategy_name, created_at}, ...]
+    """
+    db = _get_db_reader()
+    if db:
+        try:
+            return db.get_signals(symbol=symbol, limit=limit)
+        except Exception as exc:
+            logger.warning("state_reader: 读取策略信号异常: %s", exc)
+    return []
